@@ -126,6 +126,8 @@ Key points to remember from the Claude Certified Architect — Foundations cheat
 - Don't trust a single overall accuracy number — check accuracy separately for each category of data, since a good average can hide one badly-performing group.
 - Keep track of where each fact came from as it passes between agents — losing that source link makes it impossible to verify later.
 - Prompt caching can cut repeated costs by roughly 90% by matching the exact beginning (prefix) of your prompt — keep stable content (instructions, tool definitions, project config) first, and anything that varies (like the newest message) at the end.
+- Simple example of a "prefix": request 1 sends [system prompt] + [tool definitions] + [CLAUDE.md] + "message A"; request 2 sends the same [system prompt] + [tool definitions] + [CLAUDE.md] + "message B". Everything before the final message is identical, so that shared part is the cached prefix — only the new message at the end has to be processed fresh.
+- The cache lives on Anthropic's servers, not in your own application — so in a **multi-container / horizontally-scaled deployment**, every container or instance benefits from the same cache as long as they send an identical prompt prefix. You don't need sticky sessions or your own shared cache store on your end; just keep the prefix consistent across all instances, and any container can get a cache hit from a prefix another container wrote.
 - `/compact` summarizes the conversation so far to free up space, but is lossy and still uses some tokens — use it mid-task at a natural breakpoint. `/clear` (or starting a new session) wipes everything for a completely clean slate — use it when switching to an unrelated task.
 - Your saved session history and what Claude currently "sees" are not the same thing — the full record is kept, but Claude only works from a trimmed/summarized view of it once the conversation gets long.
 
@@ -136,6 +138,7 @@ Key points to remember from the Claude Certified Architect — Foundations cheat
 - ✗ Averaging conflicting numbers from two sources, or silently picking one — annotate both with their source and escalate the conflict instead.
 - ✗ Treating old data as current — always attach when a fact was published and when it was retrieved.
 - ✗ Editing CLAUDE.md mid-session, adding live timestamps to the prompt, or switching models mid-session — any of these breaks the prefix match and kills your prompt cache.
+- ✗ In a multi-container setup, letting different containers build the prefix slightly differently (e.g. different tool ordering, different config loading order) — this looks like a cache miss even though the content is logically the same. Build the prefix the same way everywhere.
 
 ---
 
