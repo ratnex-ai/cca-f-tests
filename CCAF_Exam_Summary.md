@@ -20,8 +20,77 @@ Key points to remember from the Claude Certified Architect — Foundations cheat
 
 ### Task tool & `allowed_tools` (core spawning & scoping mechanisms)
 
-- **Task tool** — the tool a coordinator calls to spawn a subagent. It's passed a definition (description, prompt, `allowed_tools`, model) so the new subagent knows its role and its limits. Only the coordinator (or an explicitly designed hierarchical sub-coordinator) should have access to it — a standard subagent should not, or it could recursively spawn its own subagents.
-- **`allowed_tools`** — the least-privilege setting that restricts exactly which tools an agent, subagent, Skill, or slash command is permitted to use. It shows up in a subagent's Task definition, in a Skill's frontmatter, and in a slash command's frontmatter — always scope it to only what that specific task actually needs, nothing more.
+- **Task tool** — the tool a coordinator calls to spawn a subagent. It's passed a definition (description, prompt, tools, model) so the new subagent knows its role and its limits. Only the coordinator (or an explicitly designed hierarchical sub-coordinator) should have access to it — a standard subagent should not, or it could recursively spawn its own subagents.
+- **`allowed_tools`** — Coordinator's scope and skill/slash command's frontmatter scope. However, `tools` is agent/sub-agent's scope..
+
+### Cost guardrail — `max_budget_usd` (Agent SDK) vs. the Messages API
+
+- **`max_budget_usd` exists only in the Agent SDK** (`ClaudeAgentOptions`; `maxBudgetUsd` in TypeScript). It's a dollar cap on the whole agent run, across every turn and every subagent.
+- **The Messages API has no dollar-budget parameter.** `max_tokens` caps the output of *one* request, not the cost of a whole loop. If you build the loop yourself, you track the cost yourself from `response.usage` and stop the loop when it goes over.
+- Like `max_turns`, it's a **runaway guardrail, not the normal way to finish**. The loop should still end on `end_turn`. Hitting the budget means something went wrong (a loop that keeps retrying, too many subagents spawned).
+- The budget is checked **between turns**, so a run can go slightly over the cap. It stops *after* the turn that crossed the limit, not partway through it.
+
+**Agent SDK** — one option, and the SDK enforces it:
+
+```python
+from claude_agent_sdk import query, ClaudeAgentOptions, ResultMessage
+
+options = ClaudeAgentOptions(
+    allowed_tools=["Read", "Grep", "Task"],
+    max_turns=30,          # runaway guardrail on turn count
+    max_budget_usd=2.00,   # runaway guardrail on dollars (the whole run, subagents included)
+)
+
+async for message in query(prompt="Audit the auth module", options=options):
+    if isinstance(message, ResultMessage):
+        print(message.total_cost_usd)       # what the run actually cost
+        if message.subtype == "error_max_budget_usd":
+            # Stopped because of the budget, not because the task was done.
+            # Report it as a partial result. Don't present it as a success.
+            ...
+```
+
+**Messages API** — no budget parameter, so you build the guardrail yourself in your own loop:
+
+```python
+from anthropic import Anthropic
+
+client = Anthropic()
+
+# USD per 1M tokens (Sonnet-class pricing; check current rates for your model)
+PRICE = {"input": 3.00, "output": 15.00, "cache_write": 3.75, "cache_read": 0.30}
+MAX_BUDGET_USD = 2.00
+
+def cost_of(usage) -> float:
+    return (
+        usage.input_tokens * PRICE["input"]
+        + usage.output_tokens * PRICE["output"]
+        + (usage.cache_creation_input_tokens or 0) * PRICE["cache_write"]
+        + (usage.cache_read_input_tokens or 0) * PRICE["cache_read"]
+    ) / 1_000_000
+
+spent = 0.0
+messages = [{"role": "user", "content": "Audit the auth module"}]
+
+for turn in range(30):                      # max_turns equivalent
+    response = client.messages.create(
+        model="claude-sonnet-4-6",
+        max_tokens=2048,                    # caps THIS response only, not the whole run
+        tools=tools,
+        messages=messages,
+    )
+    spent += cost_of(response.usage)
+
+    if response.stop_reason == "end_turn":
+        break                               # normal exit
+    if spent >= MAX_BUDGET_USD:
+        raise RuntimeError(f"budget guardrail: ${spent:.2f} spent")   # runaway exit
+
+    messages.append({"role": "assistant", "content": response.content})
+    messages.append({"role": "user", "content": run_tools(response.content)})
+```
+
+- **Exam trap:** "Set `max_tokens` low to control what the agent costs." That's wrong. `max_tokens` limits each response, but a loop with 50 turns of short responses can still cost a lot. To cap a whole run you need `max_budget_usd` (Agent SDK) or a running total of `usage` that you check in your own loop (Messages API).
 
 ## Domain 2 — Tool Design & MCP Integration
 
@@ -29,7 +98,7 @@ Key points to remember from the Claude Certified Architect — Foundations cheat
 
 - Claude only knows what a tool's description says — clearly state what it does, when to use it, and when not to.
 - If Claude keeps picking the wrong tool, first fix the tool names and descriptions before adding more complexity.
-- Tool errors should return a clear "this failed" flag with a reason, so Claude knows whether it's worth retrying.
+- Tool errors should return a clear "isError" flag with a reason, so Claude knows whether it's worth retrying.
 - Only retry errors that are temporary (like a timeout) — don't retry errors caused by bad input or missing permissions.
 - Use `tool_choice` "any" when you need Claude to always make a structured tool call.
 - Keep shared team configuration in the project's `.mcp.json` file (committed to the repo); keep personal settings in your own user-level config file.
