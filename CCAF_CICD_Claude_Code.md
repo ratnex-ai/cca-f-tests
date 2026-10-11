@@ -293,4 +293,4 @@ The exam draws its scenario questions from a fixed set of six (a sitting uses a 
 5. **Claude Code for Continuous Integration** — this file
 6. Structured Data Extraction — see [Scenario6/](Scenario6/)
 
-*Related notes:* [CCAF_Exam_Summary.md](CCAF_Exam_Summary.md) (Domain 3 for configuration, Domain 1 for `max_budget_usd`), [CCAF_Anti_Patterns.md](CCAF_Anti_Patterns.md), [CCAF_CorrectPractice.md](CCAF_CorrectPractice.md).
+*Related notes:* [CCAF_Subagents_in_CI.md](CCAF_Subagents_in_CI.md) (delegating to a subagent inside a CI review), [CCAF_Exam_Summary.md](CCAF_Exam_Summary.md) (Domain 3 for configuration, Domain 1 for `max_budget_usd`), [CCAF_Anti_Patterns.md](CCAF_Anti_Patterns.md), [CCAF_CorrectPractice.md](CCAF_CorrectPractice.md).
