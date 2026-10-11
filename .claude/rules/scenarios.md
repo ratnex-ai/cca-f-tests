@@ -17,11 +17,19 @@ format).
    line. Only claim a domain the code actually exercises.
 2. **SECTION A / SECTION B split is load-bearing, not decorative.**
    SECTION A is a commented-out reference to the real `claude-agent-sdk` /
-   Anthropic Messages API — never executed. SECTION B is the runnable
-   simulation and must stay **stdlib-only**: no `import anthropic`, no
-   `claude_agent_sdk`, no `requests`/`httpx`/`urllib`/raw sockets. If a
-   change needs the real SDK to demonstrate something, that belongs in
-   SECTION A, not SECTION B.
+   Anthropic Messages API — never executed. SECTION B is the runnable part,
+   in one of two forms — the file header must say which:
+   - **Simulation (default):** stdlib-only — no `import anthropic`, no
+     `claude_agent_sdk`, no `requests`/`httpx`/`urllib`/raw sockets — so it
+     runs deterministically with no API key.
+   - **Directional sketch:** real `ClaudeAgentOptions` + `query()` class
+     names showing who calls whom and what data is passed (e.g.
+     `Scenario3/`). Not required to run; keep it short and readable, and
+     keep routing, parallelism, refinement bounds and tool scoping visible
+     in the code so trap fixes are still structural. Rule 4's "run it"
+     does not apply — review it by reading instead.
+   SECTION A and SECTION B must show *different* things — e.g. SECTION A the
+   model-driven `agents=` version, SECTION B the code-driven one.
 3. **Every named trap needs a structural fix, not a comment.** Each trap
    listed in the header must have a matching `# EXAM TRAP #k FIX:` comment at
    the line that actually prevents the trap in code — a routing check, a

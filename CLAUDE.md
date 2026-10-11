@@ -43,11 +43,15 @@ than relying on this root file still being in context by then:
    maps to the *real* `claude-agent-sdk` / Anthropic Messages API — real
    class names (`AgentDefinition`, `ClaudeAgentOptions`, `tool_choice`, etc.),
    commented out, never run. This is what the exam actually asks about.
-3. **SECTION B — runnable simulation of the orchestration logic only**.
-   stdlib-only (asyncio, dataclasses, enum — no `anthropic` import, no
-   network calls), so it executes deterministically and lets you *watch* the
-   architecture decision play out (routing, parallel fan-out, retries,
-   partial-failure handling) without needing an API key.
+3. **SECTION B — the runnable part**, in one of two forms (the header says
+   which):
+   - *Simulation (default):* stdlib-only (asyncio, dataclasses, enum — no
+     `anthropic` import, no network calls), so it executes deterministically
+     and lets you *watch* the architecture decision play out (routing,
+     parallel fan-out, retries, partial-failure handling) without an API key.
+   - *Directional sketch:* real `ClaudeAgentOptions` + `query()` class
+     names showing how the coordinator calls subagents and what data passes
+     between them. Not meant to run. `Scenario3/` is the example.
 4. **`# EXAM TRAP #N FIX:`** comments at the exact line that fixes a named
    trap from the scenario prompt. A trap is a plausible-but-wrong design a
    naive implementation would reach for (e.g. "always fan out to every
@@ -83,14 +87,18 @@ itself (read-only tools, can't edit the scenario it's grading).
 pip install anthropic
 export ANTHROPIC_API_KEY=sk-ant-...     # only needed for the *_agent.py files
                                           # that hit the real API (e.g. Scenario1)
-python3 <file>.py                        # SECTION B simulations need no key
+python3 <file>.py                        # simulation SECTION Bs need no key
+                                          # (Scenario3's SECTION B is a sketch,
+                                          # read it rather than run it)
 ```
 
 ## Conventions for new content
 
-- SECTION B must stay stdlib-only and network-free — that's what makes it
-  runnable as a deterministic teaching demo. If a scenario needs to show real
-  SDK wiring, that goes in SECTION A as a commented-out reference only.
+- Default to a stdlib-only, network-free SECTION B — that's what makes it
+  runnable as a deterministic teaching demo. Use a directional-sketch
+  SECTION B when the call shape and data flow are the point, and keep
+  routing, parallelism, refinement bounds and tool scoping visible in the
+  code either way.
 - Comment *why* a design choice avoids a specific trap, not what the code
   does line-by-line — the point is to make the trap recognizable on the exam,
   not to document Python syntax.

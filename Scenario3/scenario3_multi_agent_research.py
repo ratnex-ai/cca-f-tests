@@ -8,18 +8,20 @@ A coordinator delegates to 4 specialist subagents (web_search, doc_analysis,
 synthesis, report_generation) to produce a cited research report.
 
 This file has two parts:
-  SECTION A — a reference snippet (not executed) showing how this maps to the
-              real `claude-agent-sdk` (AgentDefinition / ClaudeAgentOptions).
-  SECTION B — a runnable simulation of the ORCHESTRATION LOGIC ONLY (no API
-              calls, stdlib-only) so you can execute it and watch the
-              architecture decisions play out: adaptive routing, parallel
-              fan-out, structured provenance, iterative refinement, and
-              partial-failure handling.
+  SECTION A — a reference snippet (not executed): the MODEL-DRIVEN version,
+              one coordinator session with agents={...AgentDefinition...}
+              delegating through the built-in Agent tool.
+  SECTION B — a DIRECTIONAL SKETCH of the code-driven version (real class
+              names, simplified plumbing, not meant to be run): how the
+              coordinator calls each subagent via query() +
+              ClaudeAgentOptions, and exactly what data is handed over at
+              each step.
 
-The three exam traps named in the prompt are each fixed at a specific line —
-search for "EXAM TRAP" to jump to them.
-
-Run it with:  python scenario3_multi_agent_research.py
+The three exam traps are each fixed at a specific line — search for
+"EXAM TRAP" to jump to them:
+  #1 always fanning out to every subagent      -> classify + route first
+  #2 running independent subagents one by one  -> asyncio.gather
+  #3 letting synthesis search the web itself   -> synthesis has zero tools
 """
 
 from __future__ import annotations
@@ -31,8 +33,10 @@ from __future__ import annotations
 # In the real SDK, subagents are declared as AgentDefinitions and handed to
 # the coordinator via ClaudeAgentOptions.agents. The coordinator is just the
 # main agent loop, steered by a system prompt that encodes the ROUTING and
-# DELEGATION POLICY — the same policy this file implements explicitly in
-# Section B so it can be inspected step by step.
+# DELEGATION POLICY — the same policy Section B implements in Python code,
+# so it can be inspected step by step and doesn't depend on the model
+# following the prompt. (The delegation tool is named "Agent" in current
+# SDK releases; older releases and docs call it "Task".)
 #
 # from claude_agent_sdk import (
 #     ClaudeSDKClient, ClaudeAgentOptions, AgentDefinition, query,
@@ -42,13 +46,13 @@ from __future__ import annotations
 #     # allowed_tools scopes the COORDINATOR's own direct tool access -- this
 #     # is a different lever from each AgentDefinition's `tools` below, which
 #     # scopes what a SUBAGENT can do once delegated to. Restricting the
-#     # coordinator to just "Task" (the delegation tool) means it physically
+#     # coordinator to just "Agent" (the delegation tool) means it physically
 #     # CANNOT call WebSearch/Read itself and do the work in-line, bypassing
 #     # its own subagents. Without this, "always delegate" is just a prompt
 #     # suggestion the model could ignore under pressure; with it, it's an
 #     # architectural guarantee -- the same principle as EXAM TRAP #3 below,
 #     # applied one level up.
-#     allowed_tools=["Task"],
+#     allowed_tools=["Agent"],                   # "Task" on older SDKs
 #     agents={
 #         "web-search": AgentDefinition(
 #             description="Searches the web for current information",
@@ -102,316 +106,198 @@ from __future__ import annotations
 # rather than relying on the prompt asking nicely.
 
 # ======================================================================
-# SECTION B — Runnable simulation of the orchestration logic
+# SECTION B — Directional sketch: coordinator -> subagents -> data flow
 # ======================================================================
+#
+# Not meant to be run as-is. Read it top to bottom: it shows WHO calls
+# WHOM and WHAT DATA is handed over at each step, which is what the exam
+# asks about. Real class names, simplified plumbing.
+#
+#   question
+#      │
+#      ▼
+#   COORDINATOR (Python) ── 1. classify + route ──────── EXAM TRAP #1
+#      │
+#      ├── brief ──► web_search   ─┐  2. independent → run in PARALLEL
+#      ├── brief ──► doc_analysis ─┤                 ── EXAM TRAP #2
+#      │                           │
+#      │◄── JSON findings + sources┘  3. parse into typed Finding objects
+#      │
+#      ├── ALL findings inline ──► synthesis (NO tools) ─ EXAM TRAP #3
+#      │◄── narrative + gaps
+#      │
+#      ├── gaps? ── targeted brief ──► web_search   4. bounded refinement
+#      │
+#      ├── synthesis + sources ──► report_generation
+#      ▼
+#   cited report (+ Known Limitations for gaps / failed subagents)
 
 import asyncio
-import time
-from dataclasses import dataclass, field
-from datetime import datetime, timezone
-from enum import Enum, auto
-from typing import Optional
+import json
+from dataclasses import asdict, dataclass
+
+from claude_agent_sdk import ClaudeAgentOptions, ResultMessage, query
+
+MAX_REFINEMENT_ROUNDS = 2
 
 
 # ----------------------------------------------------------------------
-# Structured context passing with source provenance
+# 1. THE DATA CONTRACT between agents
 # ----------------------------------------------------------------------
-# KEY CONCEPT (D2 — Context Engineering): findings flow between agents as
-# typed objects carrying provenance, never as a flattened string. This is
-# what makes citations in the final report possible, and what lets the
-# coordinator judge evidence quality (e.g. "only one low-confidence source
-# for this claim") when deciding whether to re-delegate.
+# Subagents hand back structured findings WITH their source - never a
+# prose blob. That's what keeps every claim citable all the way into the
+# final report.
 
-@dataclass(frozen=True)
-class SourceProvenance:
-    agent: str              # which subagent produced this
-    origin: str              # URL, file path, etc.
-    retrieved_at: str        # ISO timestamp
-    confidence: float        # 0.0-1.0, subagent's self-reported confidence
-
-
-@dataclass(frozen=True)
+@dataclass
 class Finding:
     claim: str
-    provenance: SourceProvenance
+    source: str          # URL, or file#section for documents
+    agent: str           # which subagent produced it
+    confidence: float    # 0.0-1.0
 
 
-@dataclass
-class SubagentResult:
-    agent_name: str
-    success: bool
-    findings: list[Finding] = field(default_factory=list)
-    error: Optional[str] = None
-
-
-@dataclass
-class SynthesisResult:
-    narrative: str
-    findings_used: list[Finding]
-    gaps: list[str] = field(default_factory=list)   # topics needing more evidence
-
-
-class QueryType(Enum):
-    FACTUAL_LOOKUP = auto()      # e.g. "what is the current Fed funds rate"
-    DOCUMENT_REVIEW = auto()     # e.g. "summarize the attached 10-K"
-    MIXED_RESEARCH = auto()      # needs both web + document evidence
+FINDINGS_FORMAT = (
+    'Return ONLY JSON: {"findings": [{"claim": "...", "source": "...", '
+    '"confidence": 0.0}], "coverage_gaps": ["..."]}'
+)
 
 
 # ----------------------------------------------------------------------
-# EXAM TRAP #1 FIX: adaptive routing, not "always call all 4 subagents"
+# 2. THE SUBAGENTS - one ClaudeAgentOptions each
 # ----------------------------------------------------------------------
-# A coordinator that always fans out to every subagent burns tokens/latency
-# on irrelevant calls (e.g. running doc_analysis when no document was
-# provided) and increases the surface for partial failures. Classify first,
-# route only to what's needed.
+# Each subagent is a separate query() session: its own system prompt, its
+# own tools, its own (empty) context. It knows NOTHING except the brief the
+# coordinator sends it.
 
-def classify_query(query: str, has_attached_docs: bool) -> QueryType:
-    """Cheap, fast classification gate — this is intentionally NOT an LLM
-    call, because it decides whether to pay for expensive subagent fan-out.
-    In production this might be a small/fast model or a rules pass; the
-    exam point is that classification happens BEFORE delegation."""
-    if has_attached_docs and any(k in query.lower() for k in ("compare", "current", "latest", "market")):
-        return QueryType.MIXED_RESEARCH
+SUBAGENTS = {
+    "web_search": ClaudeAgentOptions(
+        system_prompt="You search the web and report findings with URLs. "
+                      "You never draw overall conclusions. " + FINDINGS_FORMAT,
+        allowed_tools=["WebSearch", "WebFetch"],     # web only
+        model="sonnet",
+        max_turns=8,
+    ),
+    "doc_analysis": ClaudeAgentOptions(
+        system_prompt="You read the attached documents and report findings "
+                      "with file#section references. " + FINDINGS_FORMAT,
+        allowed_tools=["Read", "Grep", "Glob"],      # files only, no web
+        cwd="./attached_docs",
+        model="sonnet",
+        max_turns=8,
+    ),
+    "synthesis": ClaudeAgentOptions(
+        system_prompt="You combine the findings you are given. Cite them as "
+                      "[n]. Report conflicts and evidence gaps. Return ONLY "
+                      'JSON: {"narrative": "...", "gaps": ["..."]}',
+        # EXAM TRAP #3 FIX: synthesis gets NO tools - it cannot search to
+        # fill a gap itself. It reports the gap; the coordinator decides.
+        allowed_tools=[],
+        disallowed_tools=["WebSearch", "WebFetch", "Read", "Agent"],
+        model="opus",                                # the judgement step
+        max_turns=1,
+    ),
+    "report_generation": ClaudeAgentOptions(
+        system_prompt="You format a synthesis into a Markdown report. Keep "
+                      "every [n] citation.",
+        allowed_tools=[],
+        model="sonnet",
+        max_turns=1,
+    ),
+}
+
+
+async def call_subagent(name: str, brief: str) -> str:
+    """Coordinator -> subagent. The brief is the subagent's ENTIRE context,
+    so it must be self-contained."""
+    async for message in query(prompt=brief, options=SUBAGENTS[name]):
+        if isinstance(message, ResultMessage):
+            return message.result        # the subagent's final answer
+    raise RuntimeError(f"{name} returned no result")
+
+
+def to_findings(agent: str, raw_json: str) -> list[Finding]:
+    """Subagent output -> typed Findings, tagged with who produced them."""
+    return [Finding(agent=agent, **f) for f in json.loads(raw_json)["findings"]]
+
+
+# ----------------------------------------------------------------------
+# 3. THE COORDINATOR - every hand-off between agents passes through here
+# ----------------------------------------------------------------------
+# Hub-and-spoke: subagents never call each other. The coordinator decides
+# who runs, builds each brief, and carries the data from one to the next.
+
+async def coordinator(question: str, has_attached_docs: bool) -> str:
+
+    # --- Step 1: classify, then route ---------------------------------
+    # EXAM TRAP #1 FIX: only call the subagents this question needs - not
+    # "all of them to be safe". No documents -> no doc_analysis.
+    needed = ["web_search"]
     if has_attached_docs:
-        return QueryType.DOCUMENT_REVIEW
-    return QueryType.FACTUAL_LOOKUP
+        needed.append("doc_analysis")
 
-
-def agents_needed_for(qtype: QueryType) -> set[str]:
-    """Routing table. This is the piece a naive design skips — it just
-    calls every subagent 'to be safe'. That's the exam trap."""
-    return {
-        QueryType.FACTUAL_LOOKUP: {"web_search"},
-        QueryType.DOCUMENT_REVIEW: {"doc_analysis"},
-        QueryType.MIXED_RESEARCH: {"web_search", "doc_analysis"},
-    }[qtype]
-
-
-# ----------------------------------------------------------------------
-# Simulated subagents (stand-ins for real SDK subagent invocations)
-# ----------------------------------------------------------------------
-
-async def web_search_agent(query: str, *, fail: bool = False, refined: bool = False) -> SubagentResult:
-    await asyncio.sleep(0.6)  # simulate network latency
-    if fail:
-        return SubagentResult("web_search", success=False,
-                               error="search API timeout after 3 retries")
-    now = datetime.now(timezone.utc).isoformat()
-    if refined:
-        # A targeted follow-up search (narrower query, built from the gap
-        # synthesis reported) turns up a more authoritative source.
-        findings = [
-            Finding(f"A primary-source dataset independently confirms '{query}'",
-                     SourceProvenance("web_search", "https://example-stats.gov/dataset-3", now, 0.93)),
-        ]
-    else:
-        findings = [
-            Finding(f"Recent reporting indicates growth trends relevant to '{query}'",
-                     SourceProvenance("web_search", "https://example-news.com/article-1", now, 0.82)),
-            Finding(f"A secondary source corroborates the '{query}' trend with different figures",
-                     SourceProvenance("web_search", "https://example-analysis.com/report-2", now, 0.71)),
-        ]
-    return SubagentResult("web_search", success=True, findings=findings)
-
-
-async def doc_analysis_agent(query: str, *, fail: bool = False) -> SubagentResult:
-    await asyncio.sleep(0.8)  # simulate parsing latency (slower than search)
-    if fail:
-        return SubagentResult("doc_analysis", success=False,
-                               error="attached document failed to parse (corrupt PDF)")
-    now = datetime.now(timezone.utc).isoformat()
-    findings = [
-        Finding(f"Internal document states a figure directly addressing '{query}'",
-                 SourceProvenance("doc_analysis", "uploaded:quarterly_report.pdf#p12", now, 0.95)),
-    ]
-    return SubagentResult("doc_analysis", success=True, findings=findings)
-
-
-# ----------------------------------------------------------------------
-# EXAM TRAP #3 FIX: synthesis never touches the web — it only reasons over
-# findings the coordinator hands it. It CANNOT call web_search_agent or
-# doc_analysis_agent itself; there is no such reference in its scope. If it
-# judges evidence insufficient, it reports a GAP and hands control back to
-# the coordinator, which decides whether/how to re-delegate.
-# ----------------------------------------------------------------------
-
-async def synthesis_agent(query: str, findings: list[Finding]) -> SynthesisResult:
-    await asyncio.sleep(0.4)
-    if not findings:
-        return SynthesisResult(narrative="No evidence available.", findings_used=[],
-                                gaps=[f"no evidence at all for '{query}'"])
-
-    narrative = "Synthesized view: " + "; ".join(f.claim for f in findings)
-
-    # Simulate the model's own evidence-sufficiency judgment: a claim resting
-    # on a single independent source (only one distinct agent, low average
-    # confidence) is flagged as a gap rather than silently presented as
-    # settled fact. Once a second independent source corroborates it, the
-    # gap clears -- this is what lets refinement actually succeed instead of
-    # always grinding to the round limit.
-    gaps: list[str] = []
-    distinct_agents = {f.provenance.agent for f in findings}
-    avg_confidence = sum(f.provenance.confidence for f in findings) / len(findings)
-    if len(distinct_agents) == 1 and avg_confidence < 0.80:
-        weakest = min(findings, key=lambda f: f.provenance.confidence)
-        gaps.append(f"single-source, low-confidence claim needs corroboration: '{weakest.claim[:50]}...'")
-    if distinct_agents == {"doc_analysis"}:
-        gaps.append("no independent external corroboration of internal document claims")
-
-    return SynthesisResult(narrative=narrative, findings_used=findings, gaps=gaps)
-
-
-async def report_generation_agent(query: str, synthesis: SynthesisResult) -> str:
-    await asyncio.sleep(0.3)
-    lines = [f"# Research Report: {query}", "", synthesis.narrative, "", "## Sources"]
-    for i, f in enumerate(synthesis.findings_used, start=1):
-        p = f.provenance
-        lines.append(f"[{i}] {f.claim} - *{p.agent}*, {p.origin} "
-                      f"(confidence {p.confidence:.2f}, retrieved {p.retrieved_at})")
-    if synthesis.gaps:
-        lines += ["", "## Known Limitations", *[f"- {g}" for g in synthesis.gaps]]
-    return "\n".join(lines)
-
-
-# ----------------------------------------------------------------------
-# Coordinator
-# ----------------------------------------------------------------------
-
-MAX_REFINEMENT_ROUNDS = 2   # KEY CONCEPT: refinement must be bounded, or a
-                            # perpetually "unsatisfied" synthesis agent loops forever
-
-
-class Coordinator:
-    def __init__(self):
-        self.log: list[str] = []
-
-    def _trace(self, msg: str) -> None:
-        elapsed = time.monotonic() - self._t0
-        self.log.append(f"[t+{elapsed:5.2f}s] {msg}")
-
-    async def run(self, query: str, *, has_attached_docs: bool,
-                   simulate_web_failure: bool = False) -> str:
-        self._t0 = time.monotonic()
-        qtype = classify_query(query, has_attached_docs)
-        needed = agents_needed_for(qtype)
-        self._trace(f"classified query as {qtype.name} -> routing to {sorted(needed)}")
-
-        all_findings: list[Finding] = []
-        failures: list[SubagentResult] = []
-
-        # ------------------------------------------------------------
-        # EXAM TRAP #2 area + parallel-vs-sequential:
-        # web_search and doc_analysis are INDEPENDENT (neither needs the
-        # other's output), so when both are needed they run CONCURRENTLY
-        # via asyncio.gather. Only synthesis/report — which genuinely
-        # depend on prior output — run sequentially after.
-        # ------------------------------------------------------------
-        tasks = {}
-        if "web_search" in needed:
-            tasks["web_search"] = web_search_agent(query, fail=simulate_web_failure)
-        if "doc_analysis" in needed:
-            tasks["doc_analysis"] = doc_analysis_agent(query)
-
-        if tasks:
-            self._trace(f"invoking {list(tasks.keys())} IN PARALLEL (independent subagents)")
-            results = await asyncio.gather(*tasks.values(), return_exceptions=True)
-            for name, result in zip(tasks.keys(), results):
-                # --------------------------------------------------
-                # Partial-failure handling (D5): one subagent failing
-                # must not abort the whole pipeline. We collect the
-                # failure, keep any findings we DO have, and continue —
-                # the gap gets surfaced to the user in the final report
-                # rather than hidden or fatal.
-                # --------------------------------------------------
-                if isinstance(result, Exception):
-                    self._trace(f"{name} RAISED an exception: {result!r} -- degrading gracefully")
-                    failures.append(SubagentResult(name, success=False, error=str(result)))
-                elif not result.success:
-                    self._trace(f"{name} reported failure: {result.error} -- degrading gracefully")
-                    failures.append(result)
-                else:
-                    self._trace(f"{name} returned {len(result.findings)} finding(s)")
-                    all_findings.extend(result.findings)
-
-        if not all_findings and failures:
-            self._trace("ALL required subagents failed -- aborting with explicit error")
-            return (f"Report generation failed for '{query}': "
-                     f"{'; '.join(f.error for f in failures)}")
-
-        # Findings are passed to synthesis as structured Finding objects,
-        # not concatenated text -- provenance survives into the report.
-        synthesis = await synthesis_agent(query, all_findings)
-        self._trace(f"synthesis produced narrative with {len(synthesis.gaps)} gap(s): {synthesis.gaps}")
-
-        # ------------------------------------------------------------
-        # Iterative refinement: coordinator reads synthesis.gaps and
-        # decides whether/how to re-delegate. This is coordinator policy,
-        # not synthesis reaching out on its own (that would be Trap #3).
-        # ------------------------------------------------------------
-        rounds = 0
-        while synthesis.gaps and rounds < MAX_REFINEMENT_ROUNDS:
-            rounds += 1
-            self._trace(f"refinement round {rounds}: re-delegating to address gaps")
-            # Targeted re-delegation: only call the subagent(s) relevant
-            # to the gap, not a full re-run of every subagent.
-            extra = await web_search_agent(query, refined=True)
-            if extra.success:
-                all_findings.extend(extra.findings)
-                self._trace(f"refinement round {rounds}: web_search added {len(extra.findings)} finding(s)")
-            else:
-                self._trace(f"refinement round {rounds}: web_search failed again ({extra.error}); stopping refinement")
-                break
-            synthesis = await synthesis_agent(query, all_findings)
-            self._trace(f"refinement round {rounds}: gaps now {synthesis.gaps}")
-
-        if synthesis.gaps:
-            self._trace(f"refinement budget exhausted with {len(synthesis.gaps)} gap(s) remaining -- reporting as-is")
-
-        if failures:
-            synthesis.gaps.append(
-                "partial data: " + "; ".join(f"{f.agent_name} unavailable ({f.error})" for f in failures)
-            )
-
-        report = await report_generation_agent(query, synthesis)
-        self._trace("report_generation produced final cited report")
-        return report
-
-
-# ----------------------------------------------------------------------
-# Demo
-# ----------------------------------------------------------------------
-
-async def _demo():
-    coordinator = Coordinator()
-
-    print("=" * 70)
-    print("QUERY 1: simple factual lookup, no attached docs")
-    print("(expect: ONLY web_search invoked -- doc_analysis skipped, Trap #1)")
-    print("=" * 70)
-    report1 = await coordinator.run(
-        "what is the current market growth rate", has_attached_docs=False
+    # --- Step 2: delegate - in parallel -------------------------------
+    briefs = {
+        "web_search": f"Research question: {question}\n"
+                      "Find current public sources.",
+        "doc_analysis": f"Research question: {question}\n"
+                        "Extract what the attached documents say about it.",
+    }
+    # EXAM TRAP #2 FIX: web_search and doc_analysis don't need each other's
+    # output, so they run at the same time. return_exceptions=True: one
+    # failing subagent doesn't cancel the other.
+    outputs = await asyncio.gather(
+        *(call_subagent(name, briefs[name]) for name in needed),
+        return_exceptions=True,
     )
-    print("\n".join(coordinator.log))
-    print("\n--- REPORT ---")
-    print(report1)
 
-    coordinator2 = Coordinator()
-    print("\n" + "=" * 70)
-    print("QUERY 2: mixed research with attached doc; initial web_search fails")
-    print("(expect: web_search + doc_analysis IN PARALLEL; the web_search")
-    print(" failure degrades gracefully instead of aborting the pipeline;")
-    print(" synthesis then flags a corroboration gap and the coordinator")
-    print(" re-delegates a targeted retry that resolves it)")
-    print("=" * 70)
-    report2 = await coordinator2.run(
-        "compare current market growth to our latest quarterly figures",
-        has_attached_docs=True,
-        simulate_web_failure=True,  # deterministic: initial web_search call fails
+    # --- Step 3: collect structured findings; keep going on failure ---
+    findings: list[Finding] = []
+    failures: list[str] = []
+    for name, output in zip(needed, outputs):
+        if isinstance(output, Exception):
+            failures.append(f"{name} unavailable: {output}")   # reported, not hidden
+        else:
+            findings += to_findings(name, output)
+
+    # --- Step 4: synthesis - ALL findings passed INLINE ---------------
+    # Synthesis has no memory of the other subagents and can't look
+    # anything up, so the findings (with sources) go IN the brief.
+    synthesis = json.loads(await call_subagent(
+        "synthesis",
+        f"Question: {question}\n\nFINDINGS (your entire context):\n"
+        + json.dumps([asdict(f) for f in findings], indent=2),
+    ))
+
+    # --- Step 5: bounded refinement - the COORDINATOR fills gaps ------
+    for _ in range(MAX_REFINEMENT_ROUNDS):       # never loop forever
+        if not synthesis["gaps"]:
+            break
+        extra = await call_subagent(             # narrow brief, not a full re-run
+            "web_search",
+            f"Targeted follow-up. Find primary sources for: {synthesis['gaps']}",
+        )
+        findings += to_findings("web_search", extra)
+        synthesis = json.loads(await call_subagent(
+            "synthesis",
+            f"Question: {question}\n\nFINDINGS:\n"
+            + json.dumps([asdict(f) for f in findings], indent=2),
+        ))
+
+    # --- Step 6: report - sources and limitations travel with it ------
+    report = await call_subagent(
+        "report_generation",
+        f"Question: {question}\n\nSynthesis:\n{synthesis['narrative']}",
     )
-    print("\n".join(coordinator2.log))
-    print("\n--- REPORT ---")
-    print(report2)
+    sources = "\n".join(f"[{i}] {f.claim} - {f.source} ({f.agent})"
+                        for i, f in enumerate(findings, start=1))
+    limitations = synthesis["gaps"] + failures   # leftover gaps + failed agents
+    return (f"{report}\n\n## Sources\n{sources}"
+            + ("\n\n## Known Limitations\n" + "\n".join(f"- {x}" for x in limitations)
+               if limitations else ""))
 
 
-if __name__ == "__main__":
-    asyncio.run(_demo())
+# Usage:
+#   asyncio.run(coordinator(
+#       "Compare current grid-scale battery market growth to our Q2 figures",
+#       has_attached_docs=True,
+#   ))
