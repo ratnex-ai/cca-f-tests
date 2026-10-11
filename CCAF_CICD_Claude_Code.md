@@ -221,14 +221,226 @@ There is no human in the loop, so everything a human would normally catch must b
 - **Independent reviewer, fresh session.** Don't ask the session that *wrote* the code (or the tests) to review it — it carries its own reasoning and tends to confirm it. Run the review as a **new `claude -p` call without `--resume`**.
 - **`CLAUDE.md` carries the standards.** Testing conventions, review criteria, "what counts as a real issue" go in the repo's `CLAUDE.md` / `.claude/rules/`, so every CI session loads them automatically. Don't paste them into every prompt.
 - **Be explicit about what to report.** "Only report bugs and security issues in changed lines; ignore style" beats "be thorough" — vague criteria produce noisy, low-signal comments and developers stop reading them.
-- **Large PRs: split the review.** Many files in one pass dilutes attention. Do a **per-file pass** for local issues, then a separate **cross-file integration pass** for interactions between changes.
+- **Large PRs: split the review.** Many files in one pass dilutes attention. Do a **per-file pass** for local issues, then a separate **cross-file integration pass** for interactions between changes. Worked example in §7.
 - **Re-runs must not duplicate comments.** On a new push, give Claude the previous findings (or the existing PR comments) and ask only for new or unresolved issues.
 - **Test generation needs the existing tests in context.** Otherwise it re-creates tests that already exist or ignores your fixtures and style.
 - **Structured output, then code.** Claude emits JSON (via `--json-schema`); your script posts the comments. Don't ask Claude to "post comments" by improvising shell calls to the GitHub API.
 
 ---
 
-## 7. Synchronous vs. batch: when the pipeline should wait
+## 7. Worked case: reviewing large PRs (100+ files)
+
+### The symptom
+
+The CI job runs one Claude Code review over the whole PR diff.
+
+- Findings for the **first** files are specific: line numbers, concrete fixes.
+- Findings for the **later** files are vague, generic ("consider adding error handling"), and sometimes **contradict** earlier ones.
+
+### The cause
+
+**Context exhaustion and attention dilution.** One run has to hold the whole diff of 100+ files plus everything it reads to check them. Quality drops for whatever comes late in a long context, and the model can't keep its earlier conclusions consistent with later ones.
+
+### The fix: two passes
+
+```
+PASS 1  per-file analysis  (one fresh claude -p per file)
+  file_001.diff ──► claude ──► findings/file_001.json  ┐
+  file_002.diff ──► claude ──► findings/file_002.json  │ each run sees ONE file:
+  ...                                                  │ full attention, specific
+  file_120.diff ──► claude ──► findings/file_120.json  ┘ findings, same schema
+
+PASS 2  cross-file synthesis  (one claude -p)
+  all_findings.json (findings only, NOT the diffs) ──► claude ──► consolidated.json
+  checks: contradictions, changed interfaces vs. their callers,
+          missing coverage, duplicates
+```
+
+- **Pass 1** gives every file the same full attention. A shared schema keeps the findings consistent across 100 separate runs.
+- **Pass 2** loads only the *findings*, which are small, so it has room to reason about how files interact. It can still `Read` a specific file when it needs to confirm a suspected cross-file problem.
+
+### Wrong answers the exam offers
+
+| Option | Why it's wrong |
+|---|---|
+| Use a model with a bigger context window | The whole diff may fit, but attention still dilutes over a long context. Late files still get weaker review. |
+| Tell it to "be thorough with every file" | A prompt can't fix a context problem. |
+| Truncate the diff to the first N files | Silently skips the rest of the PR. |
+| Split into batches of ~20 files, no second pass | Better per-file quality, but nobody checks consistency *across* batches. Contradictions remain. |
+| Run several reviews and keep the most common findings | Costs several times as much and still has the context problem in every run. |
+
+### Corrected GitHub Actions job
+
+```yaml
+name: large-pr-review
+on:
+  pull_request:
+    paths: ['**/*.py', '**/*.js', '**/*.ts']
+
+permissions:
+  contents: read
+  pull-requests: write
+
+jobs:
+  code-review:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    env:
+      ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+      BASE: origin/${{ github.base_ref }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0                          # history for $BASE...HEAD
+
+      - name: Install Claude Code
+        run: npm install -g @anthropic-ai/claude-code
+
+      - name: List changed files
+        run: |
+          # --diff-filter=d: skip deleted files (nothing left to review)
+          git diff --name-only --diff-filter=d "$BASE...HEAD" -- '*.py' '*.js' '*.ts' \
+            > changed_files.txt
+          echo "$(wc -l < changed_files.txt) files to review"
+
+      - name: "Pass 1: per-file analysis (fresh session per file)"
+        run: |
+          mkdir -p findings
+          while IFS= read -r file; do
+            out="findings/$(echo "$file" | tr '/' '_').json"
+            # The file's diff goes in on stdin. That also stops claude from
+            # reading the loop's own stdin, which would swallow the rest of
+            # changed_files.txt and review only the first file.
+            git diff "$BASE...HEAD" -- "$file" | claude -p \
+              "Review this diff of $file. Report only real bugs, security and
+               correctness issues in the changed lines. Also list any public
+               function, class or API signature this diff changes." \
+              --allowedTools "Read,Grep,Glob" \
+              --disallowedTools "Edit,Write,Bash,WebFetch" \
+              --output-format json \
+              --json-schema "$(cat .github/claude/file_findings.schema.json)" \
+              --max-turns 8 \
+              --max-budget-usd 0.50 \
+              > "$out" \
+            || echo "{\"is_error\": true, \"file\": \"$file\"}" > "$out"
+          done < changed_files.txt
+
+      - name: Merge findings (and record files that weren't reviewed)
+        run: |
+          jq -s '[.[] | select(.is_error == false) | .structured_output]' \
+            findings/*.json > all_findings.json
+          jq -rs '.[] | select(.is_error != false) | .file // "unknown"' \
+            findings/*.json > not_reviewed.txt
+          echo "not reviewed: $(wc -l < not_reviewed.txt) file(s)"
+
+      - name: "Pass 2: cross-file consistency (findings only)"
+        run: |
+          claude -p "all_findings.json holds per-file review findings for this PR,
+            including each file's changed interfaces. not_reviewed.txt lists files
+            whose analysis failed. Check across files for: contradictory findings,
+            changed interfaces whose callers in other files weren't updated, and
+            duplicate findings. Read a specific source file only to confirm a
+            suspected cross-file issue. List not-reviewed files as a limitation." \
+            --allowedTools "Read,Grep,Glob" \
+            --disallowedTools "Edit,Write,Bash,WebFetch" \
+            --output-format json \
+            --json-schema "$(cat .github/claude/consolidated.schema.json)" \
+            --max-turns 20 \
+            --max-budget-usd 3 \
+            > consolidated.json
+          jq -e '.is_error == false' consolidated.json
+
+      - name: Fail on critical issues or unreviewed files
+        run: |
+          jq -e '.structured_output.critical_count == 0' consolidated.json
+          test ! -s not_reviewed.txt        # partial coverage must not pass silently
+```
+
+What the corrected version fixes in the original sample:
+
+| Sample | Problem | Fix |
+|---|---|---|
+| `claude -p "Analyze changes in $file"` | Claude only gets the *file name*, not that file's diff. | Pipe `git diff -- "$file"` into the call. |
+| `claude` inside `while read ... < changed_files.txt` | `claude` reads stdin too, so it swallows the remaining file list and **only the first file gets reviewed**. | Give `claude` its own stdin (the piped diff, or `< /dev/null`). |
+| Findings format described in the prompt only | 100 separate runs drift to 100 slightly different shapes; pass 2 has to guess. | `--json-schema` with one shared schema. |
+| No per-file record of changed interfaces | Pass 2 can't spot "signature changed here, caller not updated there" without reloading every diff. | The per-file schema includes `changed_interfaces`. |
+| A failed per-file run is silently ignored | The PR passes with files nobody reviewed. | Record them in `not_reviewed.txt`, report them in pass 2, and fail the gate. |
+| `jq -e '.critical_issues == 0'` | `--output-format json` wraps the answer, so that field doesn't exist. | `.structured_output.critical_count`. |
+| `checkout@v3` default shallow clone | `origin/main...HEAD` has no history to diff against. | `fetch-depth: 0`. |
+| `git diff --name-only` | Includes deleted files, which can't be reviewed. | `--diff-filter=d`. |
+| No install step, API key, tool limits or guardrails | Won't run; nothing caps turns or cost. | Install step, secret-store key, read-only tools, `--max-turns`, `--max-budget-usd`, job timeout. |
+
+The 100+ calls in pass 1 are independent, so they can also run in parallel (`xargs -P 4`, or a job matrix over file groups) to cut wall-clock time.
+
+### The schemas
+
+`.github/claude/file_findings.schema.json` (pass 1, one per file):
+
+```json
+{
+  "type": "object",
+  "properties": {
+    "file": { "type": "string" },
+    "findings": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "properties": {
+          "line":           { "type": "integer" },
+          "issue":          { "type": "string" },
+          "severity":       { "type": "string", "enum": ["critical", "high", "medium", "low"] },
+          "recommendation": { "type": "string" },
+          "code_excerpt":   { "type": "string" }
+        },
+        "required": ["line", "issue", "severity", "recommendation"],
+        "additionalProperties": false
+      }
+    },
+    "changed_interfaces": {
+      "type": "array",
+      "items": { "type": "string" },
+      "description": "Public functions, classes or APIs whose signature or behaviour this diff changes."
+    }
+  },
+  "required": ["file", "findings", "changed_interfaces"],
+  "additionalProperties": false
+}
+```
+
+`.github/claude/consolidated.schema.json` (pass 2):
+
+```json
+{
+  "type": "object",
+  "properties": {
+    "critical_count": { "type": "integer" },
+    "cross_file_issues": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "properties": {
+          "files":          { "type": "array", "items": { "type": "string" } },
+          "issue":          { "type": "string" },
+          "severity":       { "type": "string", "enum": ["critical", "high", "medium", "low"] },
+          "recommendation": { "type": "string" }
+        },
+        "required": ["files", "issue", "severity", "recommendation"],
+        "additionalProperties": false
+      }
+    },
+    "contradictions_resolved": { "type": "array", "items": { "type": "string" } },
+    "limitations":             { "type": "array", "items": { "type": "string" } }
+  },
+  "required": ["critical_count", "cross_file_issues", "limitations"],
+  "additionalProperties": false
+}
+```
+
+> **Exam takeaway:** for a large PR, restructure the review into **per-file passes that each produce structured findings**, then a **separate synthesis pass that loads only those findings** to check cross-file consistency. Each file gets full attention, the findings stay specific, and contradictions get caught in one place. A bigger context window or a stronger prompt does not fix it.
+
+---
+
+## 8. Synchronous vs. batch: when the pipeline should wait
 
 | Situation | Use | Why |
 |---|---|---|
@@ -239,7 +451,7 @@ There is no human in the loop, so everything a human would normally catch must b
 
 ---
 
-## 8. Exam-style questions
+## 9. Exam-style questions
 
 **Q1.** A CI job runs `claude "review this PR"` and the pipeline hangs until it times out. Fix?
 **A.** Add `-p`. Without it Claude Code starts interactive mode and waits for input.
@@ -265,9 +477,12 @@ There is no human in the loop, so everything a human would normally catch must b
 **Q8.** Nightly full-repo security audit; nobody waits for it. Cheapest suitable option?
 **A.** Message Batches API — latency doesn't matter here and it's about half the cost.
 
+**Q9.** On PRs with 100+ files, findings for later files are vague and sometimes contradict earlier ones. Most effective fix?
+**A.** Restructure into **per-file analysis passes** producing structured findings, then a **separate synthesis pass** that loads only those findings to check cross-file consistency (§7). Not a bigger context window, not "be more thorough", not truncating the diff.
+
 ---
 
-## 9. Checklist
+## 10. Checklist
 
 1. `-p` on every Claude call in CI.
 2. `--output-format json` → check `is_error` / `subtype`, read `session_id` and `total_cost_usd`.
@@ -279,10 +494,11 @@ There is no human in the loop, so everything a human would normally catch must b
 8. `--resume <id>` within a job for the same task; fresh session for independent review; artifacts (not sessions) across jobs.
 9. Synchronous for blocking checks, Batches API for nobody-is-waiting work.
 10. API key from the CI secret store only.
+11. Large PRs: per-file passes with a shared schema, then a findings-only cross-file pass. Unreviewed files fail the gate.
 
 ---
 
-## 10. The six CCA-F exam scenarios (for context)
+## 11. The six CCA-F exam scenarios (for context)
 
 The exam draws its scenario questions from a fixed set of six (a sitting uses a subset):
 
