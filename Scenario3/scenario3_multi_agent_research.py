@@ -137,22 +137,94 @@ from __future__ import annotations
 # # ------------------------------------------------------------------
 # # 2. HOOKS — deterministic code around tool calls (not prompt rules)
 # # ------------------------------------------------------------------
+# # HOW A HOOK IS WIRED
+# #
+# #   hooks={ EVENT: [ HookMatcher(matcher=PATTERN, hooks=[fn, fn, ...]) ] }
+# #
+# #   EVENT    WHEN it fires:
+# #              "PreToolUse"   - before a tool runs. Can ALLOW / DENY it.
+# #              "PostToolUse"  - after a tool ran successfully. Sees the
+# #                               result; can't undo the call, but can feed
+# #                               a correction back to the model.
+# #              "SubagentStop" - when a subagent finishes. (Also: "Stop",
+# #                               "UserPromptSubmit", "PreCompact".)
+# #   matcher  WHICH tool calls, matched against the TOOL NAME - not the
+# #            agent's name:
+# #              "Agent"                - exactly that tool (delegations)
+# #              "WebSearch|WebFetch"   - regex: either tool
+# #              "mcp__corpus__.*"      - every tool on one MCP server
+# #              omitted / None         - every tool
+# #            Case-sensitive. A matcher has no meaning for events that
+# #            aren't about a tool (e.g. SubagentStop) - leave it out.
+# #   hooks    WHAT code runs: your async functions, called in order with
+# #            (input_data, tool_use_id, context). Return {} to let things
+# #            proceed; return a decision dict to block or add context.
+# #
+# # "WHICH AGENT DOES THIS APPLY TO?"
+# #   Hooks are registered once, on the coordinator's options, and fire for
+# #   EVERY matching tool call in the session - the coordinator's AND every
+# #   subagent's. The matcher selects by tool, so you target an agent through
+# #   its tools:
+# #     - matcher="Agent" catches delegations. Only the coordinator has the
+# #       Agent tool, and input_data["tool_input"]["subagent_type"] names the
+# #       subagent being called - so the hook knows exactly which one.
+# #     - matcher="WebSearch|WebFetch" effectively means "the web-search
+# #       subagent", because AgentDefinition.tools gives those tools to no
+# #       one else. Tool scoping and hook targeting work together.
+# #
+# # What input_data carries (the parts used below):
+# #   input_data["tool_name"]      e.g. "Agent", "WebFetch"
+# #   input_data["tool_input"]     the arguments of the call
+# #   input_data["tool_response"]  PostToolUse only: what the tool returned
+#
+# # --- PreToolUse on "Agent": check the brief BEFORE a subagent starts ---
 # async def audit_delegation(input_data, tool_use_id, context):
-#     # PreToolUse on the Agent tool sees every delegation BEFORE it runs:
-#     # which subagent, and the exact brief it will get. Use it to log
-#     # briefs, or deny one that's missing required context.
-#     brief = input_data["tool_input"]
+#     brief = input_data["tool_input"]           # {subagent_type, prompt, ...}
 #     if brief.get("subagent_type") == "synthesis" and "findings" not in brief.get("prompt", ""):
+#         # Synthesis has no tools (Trap #3) - a brief without the findings
+#         # gives it nothing to work from. Stop it before it wastes a run.
 #         return {"hookSpecificOutput": {
 #             "hookEventName": "PreToolUse",
-#             "permissionDecision": "deny",
+#             "permissionDecision": "deny",          # the call never happens
 #             "permissionDecisionReason": "Synthesis brief must include the findings JSON.",
 #         }}
+#     return {}                                  # allow
+#
+# # --- PostToolUse on "Agent": check a subagent's RESULT before the -------
+# # --- coordinator builds on it -------------------------------------------
+# # The Agent tool's result IS the subagent's final answer, so this runs
+# # once per finished delegation, with the subagent's name and its output.
+# async def validate_subagent_result(input_data, tool_use_id, context):
+#     agent = input_data["tool_input"].get("subagent_type")
+#     result = str(input_data.get("tool_response", ""))
+#     if agent in ("web-search", "doc-analysis") and '"source' not in result:
+#         # Findings without sources can't be cited later. The call already
+#         # happened, so instead of denying it we tell the coordinator, which
+#         # sees this reason and can re-delegate with a clearer brief.
+#         return {
+#             "decision": "block",
+#             "reason": f"{agent} returned findings without sources. "
+#                       "Re-delegate and require a source for every claim.",
+#         }
 #     return {}
 #
-# async def check_subagent_output(input_data, tool_use_id, context):
-#     # SubagentStop fires when a subagent finishes: a place to validate its
-#     # output (e.g. every finding has a source) before the coordinator uses it.
+# # --- PostToolUse on "WebSearch|WebFetch": provenance audit log ----------
+# # Effectively scoped to the web-search subagent (it's the only agent with
+# # these tools). Records every URL actually fetched, so the final report's
+# # citations can be checked against real retrievals.
+# FETCH_LOG: list[dict] = []
+#
+# async def log_web_sources(input_data, tool_use_id, context):
+#     FETCH_LOG.append({
+#         "tool": input_data["tool_name"],
+#         "query_or_url": input_data["tool_input"].get("query") or input_data["tool_input"].get("url"),
+#         "tool_use_id": tool_use_id,
+#     })
+#     return {}                                  # observe only: change nothing
+#
+# # --- SubagentStop: fires when any subagent finishes (no matcher) --------
+# async def on_subagent_stop(input_data, tool_use_id, context):
+#     # e.g. count finished subagents for cost/latency metrics
 #     return {}
 #
 # # ------------------------------------------------------------------
@@ -214,9 +286,23 @@ from __future__ import annotations
 #     },
 #
 #     # --- hooks ----------------------------------------------------------
+#     # Read each line as: ON <event>, FOR tool calls whose name matches
+#     # <matcher>, RUN <functions>. Applies to the coordinator and every
+#     # subagent; the matcher + tool scoping decide whose calls it catches.
 #     hooks={
-#         "PreToolUse": [HookMatcher(matcher="Agent", hooks=[audit_delegation])],
-#         "SubagentStop": [HookMatcher(hooks=[check_subagent_output])],
+#         "PreToolUse": [
+#             # before every delegation -> check the brief
+#             HookMatcher(matcher="Agent", hooks=[audit_delegation]),
+#         ],
+#         "PostToolUse": [
+#             # after every delegation returns -> check the subagent's result
+#             HookMatcher(matcher="Agent", hooks=[validate_subagent_result]),
+#             # after every web search/fetch (web-search subagent only)
+#             HookMatcher(matcher="WebSearch|WebFetch", hooks=[log_web_sources]),
+#         ],
+#         "SubagentStop": [
+#             HookMatcher(hooks=[on_subagent_stop]),    # no matcher: not a tool event
+#         ],
 #     },
 #
 #     # --- project context ------------------------------------------------
