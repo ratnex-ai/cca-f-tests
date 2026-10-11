@@ -465,6 +465,19 @@ Claude's final answer is a `text` block containing JSON that matches the schema:
     print(response.usage.cache_read_input_tokens)  # > 0 means the cache was hit
     ```
 - The cache lives on Anthropic's servers, not in your own application — so in a **multi-container / horizontally-scaled deployment**, every container or instance benefits from the same cache as long as they send an identical prompt prefix. You don't need sticky sessions or your own shared cache store on your end; just keep the prefix consistent across all instances, and any container can get a cache hit from a prefix another container wrote.
+- **Sessions are the opposite: they live on local disk.** In the Agent SDK, a session is the full conversation so far: the prompt, every tool call and result, and every response. The SDK saves it as a file on the machine that ran it (`~/.claude/projects/<encoded-cwd>/<session-id>.jsonl`). In a fleet (several containers, CI runners, serverless, autoscaling), the next request may land on a different machine, where that file doesn't exist, so `resume` with a perfectly valid session ID fails.
+  - **Fix: a `SessionStore` adapter.** Pass `session_store=` (Python) / `sessionStore` (TypeScript) in the options. It has two required methods: `append` (save new transcript entries) and `load` (read them back on resume). They copy the transcript to shared storage such as S3, Redis or Postgres, so any container can resume any session. Resume from the same working directory as the original run, because the store key is based on it.
+  - **Why it matters (support-agent example):** store the session ID on the customer's case. When the customer comes back, any container loads the full history: which tools ran, what `lookup_order` returned, what the agent already promised. It continues instead of re-running lookups or contradicting earlier commitments, which protects first-contact resolution.
+  - **Alternative:** don't rely on resume at all. Save the key facts (decisions, results) as your own application state and pass them into a fresh session's prompt.
+
+  ```python
+  options = ClaudeAgentOptions(
+      # RedisSessionStore: reference adapter copied from the SDK repo's
+      # examples/session_stores/ (not a published package)
+      session_store=RedisSessionStore(client=redis_client),   # shared, not local disk
+      resume=case.session_id,                                  # ID saved on the support case
+  )
+  ```
 - `/compact` summarizes the conversation so far to free up space, but is lossy and still uses some tokens — use it mid-task at a natural breakpoint. `/clear` (or starting a new session) wipes everything for a completely clean slate — use it when switching to an unrelated task.
 - Your saved session history and what Claude currently "sees" are not the same thing — the full record is kept, but Claude only works from a trimmed/summarized view of it once the conversation gets long.
 
