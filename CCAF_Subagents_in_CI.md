@@ -207,6 +207,94 @@ Notes on the choices:
 }
 ```
 
+### 4c. Variant: `--bare` for fast, reproducible CI runs
+
+**What `--bare` means:** *minimal mode*. Claude Code **reads no configuration from the machine or the repo**. It does not auto-discover:
+
+- **settings files**: `~/.claude/settings.json` (user), `.claude/settings.json` (project), `.claude/settings.local.json` (local). So none of their **permission rules, hooks, env vars or MCP entries** apply.
+- **hooks**, **skills**, **custom commands**, **subagents** (`.claude/agents/`)
+- **MCP servers** (`.mcp.json`), **installed plugins**
+- **`CLAUDE.md`** and **auto memory**
+
+It also never reads OAuth credentials or the keychain: authentication is `ANTHROPIC_API_KEY` (or an `apiKeyHelper` inside the `--settings` JSON). Startup is faster because there are no prefetches or plugin sync. Without `--bare`, `claude -p` loads everything an interactive session would, from the working directory *and* `~/.claude`.
+
+*Source: Claude Code docs, "Run Claude Code programmatically → Start faster with bare mode", and `claude --help` (v2.1.270).*
+
+**So with `--bare`, everything the run needs must be passed as a flag:**
+
+| Context | Default `-p` (loaded automatically) | `--bare` (pass it yourself) |
+|---|---|---|
+| Settings, incl. permission rules and hooks | user + project + local `settings*.json` | `--settings <file-or-json>` |
+| Project instructions | `CLAUDE.md` | `--append-system-prompt-file CLAUDE.md` |
+| Subagents | `.claude/agents/*.md` | `--agents <file-or-json>` |
+| MCP servers | `.mcp.json` | `--mcp-config <file-or-json>` |
+| Plugins | installed plugins | `--plugin-dir <path>` / `--plugin-url <url>` |
+| Skills | `.claude/skills/` | `--add-dir <dir>` loads that dir's `.claude/skills/` (but not its `agents/` or `commands/`) |
+| Tool permissions | settings `permissions.allow/deny` | `--allowedTools` / `--disallowedTools` / `--permission-mode` |
+
+**Why use it in CI:**
+
+- **Reproducible:** the run depends only on the flags in the workflow. Not on a teammate's `~/.claude` hooks, a cached home directory, a stray `settings.local.json`, or memory files.
+- **Safer on untrusted code:** without `--bare`, a `-p` run executes the hooks in a PR's `.claude/settings.json` and starts the servers in its `.mcp.json`, with **no trust prompt**. A malicious PR could add a hook. Bare mode never reads them.
+- **Faster:** this adds up when a job calls `claude -p` many times (e.g. the per-file passes for large PRs).
+
+The docs call `--bare` *the recommended mode for scripted and SDK calls*, and say it will become the default for `-p` in a future release.
+
+The same step as §4b in bare mode:
+
+```yaml
+      - name: Claude review (bare mode - everything passed explicitly)
+        run: |
+          claude -p --bare "Review this PR.
+          The full diff is in pr.diff and the test output is in pytest.log.
+          Delegate test-coverage analysis to the test-gap-analyzer subagent.
+          Its brief MUST include the paths pr.diff and pytest.log, the
+          failing test names and the changed functions." \
+            --settings .github/claude/ci-settings.json \
+            --append-system-prompt-file CLAUDE.md \
+            --agents .github/claude/agents.json \
+            --allowedTools "Read,Grep,Glob,Agent" \
+            --disallowedTools "Edit,Write,Bash,WebFetch,WebSearch" \
+            --output-format json \
+            --json-schema "$(cat .github/claude/review.schema.json)" \
+            --max-turns 25 \
+            --max-budget-usd 3 \
+            > review.json
+```
+
+`.github/claude/agents.json`: the subagent passed explicitly instead of being discovered from `.claude/agents/`:
+
+```json
+{
+  "test-gap-analyzer": {
+    "description": "Finds missing or inadequate test coverage for the specific changes in a PR, using the PR diff and the CI test failures. Read-only.",
+    "prompt": "You analyse test coverage for ONE pull request. Report only gaps tied to THIS diff or THESE failures, never generic advice.",
+    "tools": ["Read", "Grep", "Glob"],
+    "model": "sonnet"
+  }
+}
+```
+
+`.github/claude/ci-settings.json`: a CI-only settings file you choose to load, instead of whatever settings files happen to be on the runner:
+
+```json
+{
+  "permissions": {
+    "deny": ["Bash(git push *)", "Bash(curl *)", "Read(./.env)", "Read(./secrets/**)"]
+  }
+}
+```
+
+**Exam-relevant consequences**
+
+- **"Our `deny` rules / hooks in `.claude/settings.json` stopped applying in CI"** plus `--bare` → bare mode doesn't read settings files. Pass a settings file with `--settings`, or put the rules in flags (`--disallowedTools`). The help text says bare mode skips hooks, so for a must-always rule prefer permissions/flags over a hook.
+- **"The CI review ignores our coding standards"** plus `--bare` → `CLAUDE.md` wasn't loaded. Pass it with `--append-system-prompt-file`.
+- **"The subagent works locally but CI never delegates to it"** plus `--bare` → `.claude/agents/` wasn't discovered. Pass it with `--agents`.
+- **"Auth fails in CI only with `--bare`"** → there's no OAuth or keychain fallback. Set `ANTHROPIC_API_KEY`.
+- **The other direction:** a run *without* `--bare` on a PR from an untrusted fork executes that PR's hooks and MCP servers. Bare mode (or not running on untrusted PRs) closes that hole.
+
+> Rule of thumb: default `-p` = "behave like Claude Code on this machine, in this repo". `--bare` = "do exactly what these flags say and nothing else".
+
 ---
 
 ## 5. The same thing with the Agent SDK (Python)
@@ -333,6 +421,9 @@ How to pass it:
 
 **Q8.** The test-gap-analyzer should never modify code. Best control?
 **A.** `tools: Read, Grep, Glob` in its definition, which removes write tools. A "don't edit" line in its prompt is not a guarantee.
+
+**Q9.** A team adds `--bare` to their CI `claude -p` call for faster startup. Now the review ignores the repo's coding standards, never delegates to the test-gap-analyzer, and a `PreToolUse` safety hook stops firing. Why, and what's the fix?
+**A.** `--bare` reads no settings files (user, project or local), so their hooks and permission rules don't apply. It also doesn't discover `CLAUDE.md` or `.claude/agents/`. Pass the context explicitly (`--settings`, `--append-system-prompt-file CLAUDE.md`, `--agents <file>`), and enforce the safety rule with tool permissions/flags rather than a hook (or drop `--bare` for that job).
 
 ---
 

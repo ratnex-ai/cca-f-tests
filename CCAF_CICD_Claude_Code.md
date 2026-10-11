@@ -35,6 +35,7 @@ claude -p "Review the changes in this PR for security issues"
 | Flag | Purpose in CI |
 |---|---|
 | `-p "<prompt>"` | Headless, single run. Can also read the prompt from stdin: `git diff \| claude -p "Review this diff"`. |
+| `--bare` | Minimal mode: reads **no settings files** (user, project, local), hooks, skills, subagents, `.mcp.json`, plugins, `CLAUDE.md` or auto memory, and no OAuth/keychain (API key only). Faster, reproducible, and won't run an untrusted PR's hooks; pass what you need with `--settings`, `--append-system-prompt-file`, `--agents`, `--mcp-config`. See [CCAF_Subagents_in_CI.md §4c](CCAF_Subagents_in_CI.md). |
 | `--output-format text \| json \| stream-json` | `json` returns one object with `result`, `session_id`, `total_cost_usd`, `num_turns`, `is_error`, `subtype` — parse it with `jq`. |
 | `--json-schema '<schema>'` | Makes the final answer conform to a JSON Schema (returned in `structured_output`). Use it for machine-readable findings → inline PR comments. |
 | `--max-turns N` | Runaway guardrail on agent turns. |
