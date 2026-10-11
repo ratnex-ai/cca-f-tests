@@ -30,73 +30,230 @@ from __future__ import annotations
 # SECTION A — Reference: real Claude Agent SDK wiring (illustrative only)
 # ======================================================================
 #
-# In the real SDK, subagents are declared as AgentDefinitions and handed to
-# the coordinator via ClaudeAgentOptions.agents. The coordinator is just the
-# main agent loop, steered by a system prompt that encodes the ROUTING and
-# DELEGATION POLICY — the same policy Section B implements in Python code,
-# so it can be inspected step by step and doesn't depend on the model
-# following the prompt. (The delegation tool is named "Agent" in current
-# SDK releases; older releases and docs call it "Task".)
+# The MODEL-DRIVEN version: one coordinator session. Subagents are declared
+# as AgentDefinitions and handed over via ClaudeAgentOptions.agents; the
+# coordinator delegates by calling the built-in "Agent" tool (named "Task"
+# in older releases and many exam materials). Routing and delegation policy
+# live in the coordinator's system prompt here — Section B moves the same
+# policy into Python code so it doesn't depend on the model following it.
+#
+# Every property below is spelled out with WHY it matters for the exam.
+# Real code would leave many of them at their defaults.
 #
 # from claude_agent_sdk import (
-#     ClaudeSDKClient, ClaudeAgentOptions, AgentDefinition, query,
+#     AgentDefinition, AssistantMessage, ClaudeAgentOptions, HookMatcher,
+#     ResultMessage, SystemMessage, ToolUseBlock, query,
 # )
 #
-# options = ClaudeAgentOptions(
-#     # allowed_tools scopes the COORDINATOR's own direct tool access -- this
-#     # is a different lever from each AgentDefinition's `tools` below, which
-#     # scopes what a SUBAGENT can do once delegated to. Restricting the
-#     # coordinator to just "Agent" (the delegation tool) means it physically
-#     # CANNOT call WebSearch/Read itself and do the work in-line, bypassing
-#     # its own subagents. Without this, "always delegate" is just a prompt
-#     # suggestion the model could ignore under pressure; with it, it's an
-#     # architectural guarantee -- the same principle as EXAM TRAP #3 below,
-#     # applied one level up.
-#     allowed_tools=["Agent"],                   # "Task" on older SDKs
-#     agents={
-#         "web-search": AgentDefinition(
-#             description="Searches the web for current information",
-#             prompt="You search the web and return findings with source "
-#                    "URLs. You never synthesize or draw conclusions.",
-#             tools=["WebSearch", "WebFetch"],   # <-- scoped tool access
-#             model="sonnet",
+# # ------------------------------------------------------------------
+# # 1. SUBAGENTS — AgentDefinition(description, prompt, tools, model)
+# # ------------------------------------------------------------------
+# #   description - the ROUTING signal. The coordinator reads it to decide
+# #                 WHEN to delegate to this agent. Say what it does, when to
+# #                 use it, and when not to. Vague -> wrong or no delegation.
+# #   prompt      - the subagent's own system prompt. It does NOT inherit the
+# #                 coordinator's prompt or conversation; per-task facts
+# #                 arrive in the brief the coordinator writes.
+# #   tools       - the subagent's tool allow-list. RESTRICTS:
+# #                   tools=[...] -> only these
+# #                   tools=[]    -> no tools at all (pure reasoning)
+# #                   omitted     -> INHERITS ALL the coordinator's tools
+# #                                  (exam trap: "forgot to scope it")
+# #                 Never include "Agent" -> a subagent can't spawn agents
+# #                 (hub-and-spoke: only the coordinator delegates).
+# #                 MCP tools are listed by full name: mcp__<server>__<tool>.
+# #   model       - "sonnet" | "opus" | "haiku" | "inherit" (coordinator's).
+# #                 Cheap model for high-volume fan-out, strong model for the
+# #                 judgement step.
+#
+# AGENTS = {
+#     "web-search": AgentDefinition(
+#         description=(
+#             "Finds CURRENT public information on ONE narrow subtopic and "
+#             "returns findings with source URLs and publication dates. Use "
+#             "for anything time-sensitive or not in the internal corpus. "
+#             "Does not analyse documents or draw conclusions."
 #         ),
-#         "doc-analysis": AgentDefinition(
-#             description="Extracts findings from provided documents/files",
-#             prompt="You analyze the documents you are given and return "
-#                    "findings with page/section references. You do not "
-#                    "search the web.",
-#             tools=["Read", "Grep"],
-#             model="sonnet",
+#         prompt=(
+#             "You are a web search specialist. You get ONE subtopic; you have "
+#             "no other context. Return ONLY JSON: {findings: [{claim, "
+#             "source_url, published, confidence}], coverage_gaps: [...]}. "
+#             "If a source is unreachable, record it in coverage_gaps - never "
+#             "silently drop the subtopic."
 #         ),
-#         "synthesis": AgentDefinition(
-#             description="Combines findings from other subagents into a "
-#                          "coherent narrative and flags evidence gaps",
-#             prompt="You receive structured findings ONLY from the "
-#                    "coordinator. You have no search or file tools — you "
-#                    "reason over what you're given and report gaps.",
-#             tools=[],                          # <-- EXAM TRAP #3, see below
-#             model="opus",
-#         ),
-#         "report-generation": AgentDefinition(
-#             description="Formats final findings + synthesis into a cited "
-#                          "report",
-#             prompt="You produce the final Markdown report with inline "
-#                    "citations mapped to source provenance.",
-#             tools=[],
-#             model="sonnet",
-#         ),
-#     },
-#     system_prompt=(
-#         "You are a research coordinator. Classify each query first; only "
-#         "invoke the subagents the query actually needs. web-search and "
-#         "doc-analysis are independent — invoke them concurrently when "
-#         "both are needed. Always pass structured findings (with source "
-#         "provenance), never raw text, to synthesis and report-generation. "
-#         "After synthesis, check its reported gaps; if any remain and you "
-#         "have refinement budget left, re-delegate narrowly to fill them."
+#         tools=["WebSearch", "WebFetch"],          # web only
+#         model="haiku",                            # many parallel calls -> cheap
 #     ),
+#     "doc-analysis": AgentDefinition(
+#         description=(
+#             "Extracts findings from the internal research corpus and any "
+#             "attached files, with document id and section references. Use "
+#             "when the question involves internal or provided documents. "
+#             "Does not search the web."
+#         ),
+#         prompt=(
+#             "You are a document analyst. Search the corpus, fetch the "
+#             "relevant documents and extract findings with doc_id#section "
+#             "references. Same JSON shape as web-search."
+#         ),
+#         tools=[
+#             "Read", "Grep",                       # attached files
+#             "mcp__corpus__search_corpus",         # MCP tools, full names
+#             "mcp__corpus__fetch_document",
+#         ],
+#         model="sonnet",
+#     ),
+#     "synthesis": AgentDefinition(
+#         description=(
+#             "Combines findings from web-search and doc-analysis into one "
+#             "analysis, keeping claim->source attribution, surfacing "
+#             "conflicts and listing evidence gaps. Pass it ALL findings "
+#             "inline as JSON - it cannot look anything up."
+#         ),
+#         prompt=(
+#             "You receive structured findings ONLY from the coordinator. You "
+#             "have no search or file tools. Keep every claim's source. Where "
+#             "sources conflict, report both with dates; never silently pick "
+#             "one. Return JSON: {narrative, conflicts: [...], gaps: [...]}."
+#         ),
+#         tools=[],                                 # <-- EXAM TRAP #3, see Section B
+#         model="opus",                             # the judgement step
+#     ),
+#     "report-generation": AgentDefinition(
+#         description=(
+#             "Formats the final synthesis into a cited Markdown report. Use "
+#             "last, after synthesis has no open gaps or refinement is spent."
+#         ),
+#         prompt=(
+#             "You produce the final Markdown report with inline [n] citations "
+#             "mapped to sources, plus 'Conflicting evidence' and 'Known "
+#             "limitations' sections."
+#         ),
+#         tools=["Write"],                          # writes report.md, nothing else
+#         model="sonnet",
+#     ),
+# }
+#
+# # ------------------------------------------------------------------
+# # 2. HOOKS — deterministic code around tool calls (not prompt rules)
+# # ------------------------------------------------------------------
+# async def audit_delegation(input_data, tool_use_id, context):
+#     # PreToolUse on the Agent tool sees every delegation BEFORE it runs:
+#     # which subagent, and the exact brief it will get. Use it to log
+#     # briefs, or deny one that's missing required context.
+#     brief = input_data["tool_input"]
+#     if brief.get("subagent_type") == "synthesis" and "findings" not in brief.get("prompt", ""):
+#         return {"hookSpecificOutput": {
+#             "hookEventName": "PreToolUse",
+#             "permissionDecision": "deny",
+#             "permissionDecisionReason": "Synthesis brief must include the findings JSON.",
+#         }}
+#     return {}
+#
+# async def check_subagent_output(input_data, tool_use_id, context):
+#     # SubagentStop fires when a subagent finishes: a place to validate its
+#     # output (e.g. every finding has a source) before the coordinator uses it.
+#     return {}
+#
+# # ------------------------------------------------------------------
+# # 3. COORDINATOR — ClaudeAgentOptions
+# # ------------------------------------------------------------------
+# options = ClaudeAgentOptions(
+#     # --- identity -----------------------------------------------------
+#     # A plain string REPLACES Claude Code's default system prompt; the
+#     # preset form {"type": "preset", "preset": "claude_code", "append":
+#     # "..."} keeps it and adds yours. A pure coordinator wants its own.
+#     system_prompt=(
+#         "You are a research coordinator. You never research or write "
+#         "yourself; you delegate.\n"
+#         "1. Decompose the question into subtopics that cover its FULL scope "
+#         "(too-narrow decomposition is a failure).\n"
+#         "2. Invoke only the subagents the question needs. web-search and "
+#         "doc-analysis are independent: invoke them IN PARALLEL (several "
+#         "Agent calls in one response).\n"
+#         "3. Each subagent sees ONLY your brief: include the subtopic, scope "
+#         "and any findings it must work from.\n"
+#         "4. Pass ALL findings, as JSON with sources, to synthesis.\n"
+#         "5. If synthesis reports gaps, re-delegate narrowly, at most twice; "
+#         "then report remaining gaps as known limitations.\n"
+#         "6. Finish with report-generation."
+#     ),
+#     model="sonnet",                       # coordinator's own model
+#     fallback_model="haiku",               # used if the primary is unavailable
+#
+#     # --- the subagents --------------------------------------------------
+#     agents=AGENTS,
+#
+#     # --- tool scoping, level 1: the COORDINATOR -------------------------
+#     # allowed_tools = auto-approved without a permission prompt. Only the
+#     # delegation tool: the coordinator cannot search or read files itself
+#     # and skip its subagents. "Always delegate" becomes architecture, not a
+#     # prompt suggestion (EXAM TRAP #3's principle, one level up).
+#     allowed_tools=["Agent"],              # "Task" on older SDKs
+#     # disallowed_tools = removed from the toolset entirely - a hard block
+#     # for tools nobody in this system should touch.
+#     disallowed_tools=["Bash", "Edit", "NotebookEdit"],
+#     # Tool scoping, level 2, is each AgentDefinition.tools above.
+#
+#     # --- permissions ----------------------------------------------------
+#     # "default"           - anything not pre-approved needs approval
+#     # "acceptEdits"       - auto-approve file edits
+#     # "plan"              - analyse and propose only, no execution
+#     # "bypassPermissions" - approve everything; sandboxed CI only
+#     permission_mode="default",
+#
+#     # --- external tools via MCP -----------------------------------------
+#     # Registered once on the coordinator; subagents get access only if
+#     # their AgentDefinition.tools lists them (doc-analysis above).
+#     mcp_servers={
+#         "corpus": {                       # -> mcp__corpus__<tool>
+#             "type": "stdio",
+#             "command": "python",
+#             "args": ["research_corpus_mcp_server.py"],
+#         },
+#     },
+#
+#     # --- hooks ----------------------------------------------------------
+#     hooks={
+#         "PreToolUse": [HookMatcher(matcher="Agent", hooks=[audit_delegation])],
+#         "SubagentStop": [HookMatcher(hooks=[check_subagent_output])],
+#     },
+#
+#     # --- project context ------------------------------------------------
+#     cwd="./research_workspace",           # where attached docs / report.md live
+#     add_dirs=["./attached_docs"],         # extra directories agents may read
+#     setting_sources=["project"],          # load .claude/: CLAUDE.md, rules,
+#                                           # skills. NOT loaded unless listed.
+#
+#     # --- guardrails (runaway stops, not the normal way to finish) -------
+#     max_turns=30,                         # coordinator turn cap
+#     max_budget_usd=5.00,                  # dollar cap: coordinator + ALL subagents
+#
+#     # --- sessions (not used on a fresh run) -----------------------------
+#     # resume="<session_id>"   continue the same research task
+#     # fork_session=True       branch it to try a different decomposition
 # )
+#
+# # ------------------------------------------------------------------
+# # 4. RUN IT — and read the stream
+# # ------------------------------------------------------------------
+# async def run(question: str) -> str:
+#     async for message in query(prompt=question, options=options):
+#         if isinstance(message, SystemMessage) and message.subtype == "init":
+#             session_id = message.data.get("session_id")   # save for resume=
+#         elif isinstance(message, AssistantMessage):
+#             # parent_tool_use_id is None for the coordinator and set for a
+#             # subagent's messages -> tells you WHO is acting.
+#             for block in message.content:
+#                 if isinstance(block, ToolUseBlock) and block.name in ("Agent", "Task"):
+#                     # Several Agent blocks in ONE message = parallel fan-out.
+#                     print("delegate ->", block.input["subagent_type"])
+#         elif isinstance(message, ResultMessage):
+#             # subtype "success", or e.g. "error_max_turns" /
+#             # "error_max_budget_usd" - a guardrail stopped it: report as
+#             # PARTIAL, never as a finished report.
+#             print(message.subtype, message.num_turns, message.total_cost_usd)
+#             return message.result
 #
 # The key point for the exam: tool scoping happens at TWO levels here --
 # `allowed_tools` on ClaudeAgentOptions restricts the coordinator to only
